@@ -8159,7 +8159,10 @@ enum UpdateCheck {
     private static let githubReleaseURLPathPrefix = "/fazzilka/voice_to_text/releases/tag/"
     static let maxReleaseResponseBytes = 512 * 1024
 
-    static func fetchLatest() async -> Result<GitHubRelease, UpdateCheckFailure> {
+    /// A successful `nil` result means the repository does not have a
+    /// published release yet. GitHub represents that normal bootstrap
+    /// state with HTTP 404 at `/releases/latest`.
+    static func fetchLatest() async -> Result<GitHubRelease?, UpdateCheckFailure> {
         var req = URLRequest(url: GITHUB_LATEST_RELEASE_URL)
         req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         // The privacy docs promise exactly this fixed token — no
@@ -8183,9 +8186,12 @@ enum UpdateCheck {
         }
     }
 
-    static func parseLatest(data: Data, response: URLResponse) -> Result<GitHubRelease, UpdateCheckFailure> {
+    static func parseLatest(data: Data, response: URLResponse) -> Result<GitHubRelease?, UpdateCheckFailure> {
         guard let http = response as? HTTPURLResponse else {
             return .failure(.unexpectedResponse)
+        }
+        if http.statusCode == 404 {
+            return .success(nil)
         }
         guard (200..<300).contains(http.statusCode) else {
             return .failure(.httpStatus(http.statusCode))
@@ -16278,19 +16284,31 @@ final class VoiceToTextApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard settings.checkForUpdates else { return }
         let outcome = await UpdateCheck.fetchLatest()
         await MainActor.run {
-            self.recordUpdateCheck(release: try? outcome.get(), source: source)
-            guard let release = try? outcome.get() else { return }
+            self.recordUpdateCheck(outcome: outcome, source: source)
+            guard case .success(let release?) = outcome else { return }
             self.handleFetchedRelease(release)
         }
     }
 
-    private func recordUpdateCheck(release: GitHubRelease?, source: UpdateCheckSource) {
+    private func recordUpdateCheck(outcome: Result<GitHubRelease?, UpdateCheckFailure>,
+                                   source: UpdateCheckSource) {
+        let release: GitHubRelease?
+        let result: UpdateCheckResult
         let skippedVersions = source == .manual ? [] : settings.skippedVersions
-        let result = updateCheckResult(
-            for: release,
-            currentVersion: currentBundleVersion(),
-            skippedVersions: skippedVersions
-        )
+        switch outcome {
+        case .failure:
+            release = nil
+            result = .failed
+        case .success(let fetchedRelease):
+            release = fetchedRelease
+            result = fetchedRelease.map {
+                updateCheckResult(
+                    for: $0,
+                    currentVersion: currentBundleVersion(),
+                    skippedVersions: skippedVersions
+                )
+            } ?? .upToDate
+        }
         settings.lastUpdateCheckAt = Date()
         settings.lastUpdateCheckSource = source
         settings.lastUpdateCheckResult = result
@@ -16421,12 +16439,12 @@ final class VoiceToTextApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                   let self,
                   !self.isTerminating else { return }
             self.manualUpdateCheckTask = nil
-            self.recordUpdateCheck(release: try? outcome.get(), source: .manual)
+            self.recordUpdateCheck(outcome: outcome, source: .manual)
             self.finishManualUpdateCheck(outcome)
         }
     }
 
-    private func finishManualUpdateCheck(_ outcome: Result<GitHubRelease, UpdateCheckFailure>) {
+    private func finishManualUpdateCheck(_ outcome: Result<GitHubRelease?, UpdateCheckFailure>) {
         manualUpdateCheckTask = nil
         isCheckingForUpdates = false
         let release: GitHubRelease
@@ -16435,7 +16453,12 @@ final class VoiceToTextApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             rebuildMenu()
             showUpdateCheckFailedAlert(failure)
             return
-        case .success(let fetched):
+        case .success(nil):
+            pendingUpdate = nil
+            rebuildMenu()
+            showUpToDateAlert(currentVersion: currentBundleVersion())
+            return
+        case .success(let fetched?):
             release = fetched
         }
 
@@ -19869,8 +19892,8 @@ private enum VoiceToTextSelfTest {
         )
         try expect(
             UpdateCheck.parseLatest(data: releaseData, response: notFound),
-            equals: .failure(.httpStatus(404)),
-            "update parsing should reject non-2xx HTTP responses with the status code"
+            equals: .success(nil),
+            "update parsing should treat a repository without published releases as up to date"
         )
         let rateLimited = HTTPURLResponse(url: GITHUB_LATEST_RELEASE_URL,
                                           statusCode: 403,
@@ -22710,7 +22733,13 @@ private final class VoiceToTextControlPanelApp: NSObject, NSApplicationDelegate,
             guard !Task.isCancelled, let self else { return }
             self.updateTask = nil
             switch outcome {
-            case .success(let release):
+            case .success(nil):
+                self.settings.lastUpdateCheckAt = Date()
+                self.settings.lastUpdateCheckSource = .manual
+                self.settings.lastUpdateCheckVersion = ""
+                self.settings.lastUpdateCheckResult = .upToDate
+                self.updateState = .upToDate(currentBundleVersion())
+            case .success(let release?):
                 self.settings.lastUpdateCheckAt = Date()
                 self.settings.lastUpdateCheckSource = .manual
                 self.settings.lastUpdateCheckVersion = release.version
