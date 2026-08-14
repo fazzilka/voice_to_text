@@ -7311,7 +7311,8 @@ private func clipboardPasteKeyboardEventSteps(commandKey: CGKeyCode,
     ]
 }
 
-private func postKeyboardEventSteps(_ steps: [KeyboardEventStep]) -> Bool {
+private func postKeyboardEventSteps(_ steps: [KeyboardEventStep],
+                                    targetPID: pid_t? = nil) -> Bool {
     let source = CGEventSource(stateID: .hidSystemState)
     let events = steps.compactMap { step -> CGEvent? in
         guard let event = CGEvent(keyboardEventSource: source,
@@ -7325,19 +7326,167 @@ private func postKeyboardEventSteps(_ steps: [KeyboardEventStep]) -> Bool {
     guard events.count == steps.count else { return false }
 
     for event in events {
-        event.post(tap: .cghidEventTap)
+        if let targetPID {
+            event.postToPid(targetPID)
+        } else {
+            event.post(tap: .cghidEventTap)
+        }
     }
     return true
+}
+
+func capturedInsertionApplicationMatches(capturedPID: pid_t,
+                                         capturedBundleIdentifier: String,
+                                         runningPID: pid_t,
+                                         runningBundleIdentifier: String?,
+                                         isTerminated: Bool) -> Bool {
+    !isTerminated
+        && capturedPID == runningPID
+        && capturedBundleIdentifier == (runningBundleIdentifier ?? "")
+}
+
+@MainActor
+private final class CapturedDictationDestination {
+    let applicationPID: pid_t
+    let applicationName: String
+    let bundleIdentifier: String
+
+    private let applicationElement: AXUIElement
+    private let windowElement: AXUIElement?
+    private let focusedElement: AXUIElement
+
+    private init(application: NSRunningApplication,
+                 applicationElement: AXUIElement,
+                 windowElement: AXUIElement?,
+                 focusedElement: AXUIElement) {
+        applicationPID = application.processIdentifier
+        applicationName = application.localizedName ?? "unknown"
+        bundleIdentifier = application.bundleIdentifier ?? ""
+        self.applicationElement = applicationElement
+        self.windowElement = windowElement
+        self.focusedElement = focusedElement
+    }
+
+    static func capture() -> CapturedDictationDestination? {
+        guard let application = NSWorkspace.shared.frontmostApplication,
+              !application.isTerminated else {
+            return nil
+        }
+
+        let applicationElement = AXUIElementCreateApplication(application.processIdentifier)
+        AXUIElementSetMessagingTimeout(applicationElement, 0.25)
+        guard let focusedElement = elementAttribute(
+            applicationElement,
+            kAXFocusedUIElementAttribute as CFString
+        ) else {
+            return nil
+        }
+
+        var focusedElementPID: pid_t = 0
+        guard AXUIElementGetPid(focusedElement, &focusedElementPID) == .success,
+              focusedElementPID == application.processIdentifier else {
+            return nil
+        }
+        AXUIElementSetMessagingTimeout(focusedElement, 0.25)
+
+        let windowElement = elementAttribute(focusedElement, kAXWindowAttribute as CFString)
+            ?? elementAttribute(applicationElement, kAXFocusedWindowAttribute as CFString)
+        if let windowElement {
+            AXUIElementSetMessagingTimeout(windowElement, 0.25)
+        }
+
+        return CapturedDictationDestination(
+            application: application,
+            applicationElement: applicationElement,
+            windowElement: windowElement,
+            focusedElement: focusedElement
+        )
+    }
+
+    /// Restores the exact application, window, and focused accessibility
+    /// element captured when recording began. The bounded retries cover the
+    /// asynchronous activation/unminimize work performed by macOS.
+    func restoreForInsertion() async -> Bool {
+        guard let application = NSWorkspace.shared.runningApplications.first(where: {
+            $0.processIdentifier == applicationPID
+        }),
+        capturedInsertionApplicationMatches(
+            capturedPID: applicationPID,
+            capturedBundleIdentifier: bundleIdentifier,
+            runningPID: application.processIdentifier,
+            runningBundleIdentifier: application.bundleIdentifier,
+            isTerminated: application.isTerminated
+        ) else {
+            return false
+        }
+
+        if let windowElement {
+            _ = AXUIElementSetAttributeValue(
+                windowElement,
+                kAXMinimizedAttribute as CFString,
+                kCFBooleanFalse
+            )
+            _ = AXUIElementPerformAction(windowElement, kAXRaiseAction as CFString)
+        }
+        _ = application.activate(options: [])
+
+        for attempt in 0..<8 {
+            if let windowElement {
+                _ = AXUIElementSetAttributeValue(
+                    applicationElement,
+                    kAXFocusedWindowAttribute as CFString,
+                    windowElement
+                )
+                _ = AXUIElementPerformAction(windowElement, kAXRaiseAction as CFString)
+            }
+            _ = AXUIElementSetAttributeValue(
+                focusedElement,
+                kAXFocusedAttribute as CFString,
+                kCFBooleanTrue
+            )
+
+            if isRestored(application: application) {
+                return true
+            }
+            if attempt < 7 {
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+        }
+        return false
+    }
+
+    private func isRestored(application: NSRunningApplication) -> Bool {
+        guard !application.isTerminated,
+              NSWorkspace.shared.frontmostApplication?.processIdentifier == applicationPID,
+              let currentFocusedElement = Self.elementAttribute(
+                applicationElement,
+                kAXFocusedUIElementAttribute as CFString
+              ) else {
+            return false
+        }
+        return CFEqual(currentFocusedElement, focusedElement)
+    }
+
+    private static func elementAttribute(_ element: AXUIElement,
+                                         _ attribute: CFString) -> AXUIElement? {
+        var raw: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute, &raw) == .success,
+              let raw,
+              CFGetTypeID(raw) == AXUIElementGetTypeID() else {
+            return nil
+        }
+        return unsafeDowncast(raw, to: AXUIElement.self)
+    }
 }
 
 @MainActor
 private enum KeyboardShortcutPoster {
     @discardableResult
-    static func postReturn() -> Bool {
+    static func postReturn(targetPID: pid_t? = nil) -> Bool {
         postKeyboardEventSteps([
             KeyboardEventStep(virtualKey: RETURN_KEYCODE, keyDown: true, flags: []),
             KeyboardEventStep(virtualKey: RETURN_KEYCODE, keyDown: false, flags: []),
-        ])
+        ], targetPID: targetPID)
     }
 }
 
@@ -7350,9 +7499,11 @@ enum TextInserter {
     }
 
     @discardableResult
-    static func insert(_ text: String, strategy: TextInsertionStrategy = defaultStrategy) -> Bool {
+    static func insert(_ text: String,
+                       strategy: TextInsertionStrategy = defaultStrategy,
+                       targetPID: pid_t? = nil) -> Bool {
         for candidate in textInsertionStrategyChain(primary: strategy) {
-            if insert(text, using: candidate) {
+            if insert(text, using: candidate, targetPID: targetPID) {
                 if candidate != strategy {
                     log("text insertion fallback succeeded: \(candidate.displayName)")
                 }
@@ -7363,12 +7514,14 @@ enum TextInserter {
         return false
     }
 
-    private static func insert(_ text: String, using strategy: TextInsertionStrategy) -> Bool {
+    private static func insert(_ text: String,
+                               using strategy: TextInsertionStrategy,
+                               targetPID: pid_t?) -> Bool {
         switch strategy {
         case .clipboardPaste:
-            return ClipboardPasteInserter.insert(text)
+            return ClipboardPasteInserter.insert(text, targetPID: targetPID)
         case .directUnicode:
-            return DirectUnicodeInserter.insert(text)
+            return DirectUnicodeInserter.insert(text, targetPID: targetPID)
         }
     }
 }
@@ -7386,7 +7539,7 @@ private enum ClipboardPasteInserter {
         return pb.setString(text, forType: .string)
     }
 
-    static func insert(_ text: String) -> Bool {
+    static func insert(_ text: String, targetPID: pid_t? = nil) -> Bool {
         let pasteboard = NSPasteboard.general
         pendingTransaction?.restoreNowIfCurrent(reason: "superseded by another dictation")
         let previous = PasteboardSnapshot.capture(from: pasteboard)
@@ -7410,7 +7563,7 @@ private enum ClipboardPasteInserter {
 
         let steps = clipboardPasteKeyboardEventSteps(commandKey: virtualKeyCommand,
                                                      pasteKey: virtualKeyV)
-        guard post(steps) else {
+        guard post(steps, targetPID: targetPID) else {
             log("paste event creation failed")
             transaction.restoreNowIfCurrent(reason: "paste event creation failed")
             return false
@@ -7418,11 +7571,11 @@ private enum ClipboardPasteInserter {
         return true
     }
 
-    private static func post(_ steps: [KeyboardEventStep]) -> Bool {
+    private static func post(_ steps: [KeyboardEventStep], targetPID: pid_t?) -> Bool {
         // Post Command as real key events instead of only tagging the V
         // events with .maskCommand. Sleep/wake can leave session modifier
         // state unreliable for flag-only synthetic shortcuts.
-        return postKeyboardEventSteps(steps)
+        return postKeyboardEventSteps(steps, targetPID: targetPID)
     }
 }
 
@@ -7565,17 +7718,19 @@ private final class ClipboardPasteTransaction: NSObject, NSPasteboardItemDataPro
 private enum DirectUnicodeInserter {
     private static let maxUTF16UnitsPerEvent = 20
 
-    static func insert(_ text: String) -> Bool {
+    static func insert(_ text: String, targetPID: pid_t? = nil) -> Bool {
         let source = CGEventSource(stateID: .combinedSessionState)
         var didPostAll = true
 
         for chunk in unicodeInsertionChunks(for: text, maxUTF16UnitsPerEvent: maxUTF16UnitsPerEvent) {
-            didPostAll = post(chunk, source: source) && didPostAll
+            didPostAll = post(chunk, source: source, targetPID: targetPID) && didPostAll
         }
         return didPostAll
     }
 
-    private static func post(_ units: [UInt16], source: CGEventSource?) -> Bool {
+    private static func post(_ units: [UInt16],
+                             source: CGEventSource?,
+                             targetPID: pid_t?) -> Bool {
         // Each chunk posts a keyDown AND a matching keyUp carrying the
         // same unicode payload — standard CGEvent unicode-typing
         // practice. A keyDown-only stream leaves apps that track key
@@ -7592,8 +7747,13 @@ private enum DirectUnicodeInserter {
                 event.keyboardSetUnicodeString(stringLength: buffer.count, unicodeString: base)
             }
         }
-        down.post(tap: .cghidEventTap)
-        up.post(tap: .cghidEventTap)
+        if let targetPID {
+            down.postToPid(targetPID)
+            up.postToPid(targetPID)
+        } else {
+            down.post(tap: .cghidEventTap)
+            up.post(tap: .cghidEventTap)
+        }
         return true
     }
 }
@@ -10536,6 +10696,10 @@ final class VoiceToTextApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var recordingHUDTargetSessionToken = 0
     private var recordingHUDWaitingForInitialTarget = false
     private var insertionTargetCache: [pid_t: CachedInsertionTarget] = [:]
+    /// Immutable destination for the active recording. HUD tracking may
+    /// follow the user's current window for visual feedback, but completed
+    /// text must always return to the field where recording began.
+    private var activeDictationDestination: CapturedDictationDestination?
     private var globalMouseDownMonitor: Any?
     private var lastExternalClick: LastExternalClick?
     private var errorFlashWorkItem: DispatchWorkItem?
@@ -11140,6 +11304,7 @@ final class VoiceToTextApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func prepareForStartupAttempt() {
         cancelMaxDurationAutoRelease()
+        activeDictationDestination = nil
 
         if isRecording || audio.isRunning {
             let captured = audio.endRecording()
@@ -12418,6 +12583,8 @@ final class VoiceToTextApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return
         }
         let initialInsertionContext = insertionTargetQueryContext()
+        let capturedDestination = CapturedDictationDestination.capture()
+        activeDictationDestination = nil
         cancelAudioIdleStop()
         var recoveryJournal: PendingDictationJournal?
         do {
@@ -12437,6 +12604,12 @@ final class VoiceToTextApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return
         }
         isRecording = true
+        activeDictationDestination = capturedDestination
+        if let capturedDestination {
+            log("dictation destination locked at recording start: \(capturedDestination.applicationName) (\(capturedDestination.bundleIdentifier))")
+        } else {
+            log("dictation destination unavailable at recording start; completed text will remain in history")
+        }
         if setupChecklistWindow?.isVisible == true {
             hotkeyTestSucceeded = true
             updateSetupChecklist()
@@ -12455,6 +12628,8 @@ final class VoiceToTextApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func handleRelease(shortcut: DictationReleaseShortcut = .standard,
                                hotkeyDetectedAt: TimeInterval? = nil) {
         guard isRecording, !isTerminating else { return }
+        let dictationDestination = activeDictationDestination
+        activeDictationDestination = nil
         let releaseReceivedAt = ProcessInfo.processInfo.systemUptime
         let hotkeyDispatchSeconds = hotkeyDetectedAt.map { max(0, releaseReceivedAt - $0) }
         let settingsRefreshStartedAt = ProcessInfo.processInfo.systemUptime
@@ -12602,20 +12777,42 @@ final class VoiceToTextApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         }
 
                         let insertionStartedAt = ProcessInfo.processInfo.systemUptime
-                        let inserted = TextInserter.insert(
-                            pastedText(from: finalText, suffix: settings.pasteSuffix)
-                        )
+                        let destinationRestored = await dictationDestination?.restoreForInsertion() == true
+                        let inserted: Bool
+                        if let dictationDestination, destinationRestored {
+                            inserted = TextInserter.insert(
+                                pastedText(from: finalText, suffix: settings.pasteSuffix),
+                                targetPID: dictationDestination.applicationPID
+                            )
+                            if inserted {
+                                log("text inserted into destination captured at recording start: \(dictationDestination.applicationName) (\(dictationDestination.bundleIdentifier))")
+                            }
+                        } else {
+                            inserted = false
+                            if let dictationDestination {
+                                log("text insertion skipped: original destination could not be restored: \(dictationDestination.applicationName) (\(dictationDestination.bundleIdentifier)); transcript remains in history")
+                            } else {
+                                log("text insertion skipped: no destination was captured at recording start; transcript remains in history")
+                            }
+                        }
                         let insertionCompletedAt = ProcessInfo.processInfo.systemUptime
                         var enterDelaySeconds: Double?
                         if inserted {
-                            if shouldPressEnterAfterInsertion {
+                            if shouldPressEnterAfterInsertion,
+                               let dictationDestination {
                                 let enterDelayStartedAt = ProcessInfo.processInfo.systemUptime
                                 let enterDelayNanoseconds = UInt64(settings.enterDelayMilliseconds) * 1_000_000
                                 if enterDelayNanoseconds > 0 {
                                     try? await Task.sleep(nanoseconds: enterDelayNanoseconds)
                                 }
-                                if KeyboardShortcutPoster.postReturn() {
+                                let destinationRestoredForReturn = await dictationDestination.restoreForInsertion()
+                                if destinationRestoredForReturn,
+                                   KeyboardShortcutPoster.postReturn(
+                                    targetPID: dictationDestination.applicationPID
+                                   ) {
                                     log("return posted after dictation")
+                                } else if !destinationRestoredForReturn {
+                                    log("return skipped: original dictation destination lost focus")
                                 } else {
                                     log("return event creation failed")
                                 }
@@ -12680,6 +12877,7 @@ final class VoiceToTextApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func recoverActiveRecordingToHistory(reason: String,
                                                  runDeferredRefresh: Bool = true,
                                                  completion: (() -> Void)? = nil) {
+        activeDictationDestination = nil
         guard isRecording || audio.isRunning else {
             hotkey.resetToggleState()
             completion?()
@@ -12779,6 +12977,7 @@ final class VoiceToTextApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // recovery journal. The next launch transcribes it into history.
     private func cancelRecordingForTermination() {
         cancelMaxDurationAutoRelease()
+        activeDictationDestination = nil
         hotkey.onPress = nil
         hotkey.onRelease = nil
         hotkey.onReleaseAlternate = nil
@@ -17176,6 +17375,51 @@ private enum VoiceToTextSelfTest {
     }
 
     private static func testInsertionTargetTracking() throws {
+        try expect(
+            capturedInsertionApplicationMatches(
+                capturedPID: 42,
+                capturedBundleIdentifier: "com.example.Editor",
+                runningPID: 42,
+                runningBundleIdentifier: "com.example.Editor",
+                isTerminated: false
+            ),
+            equals: true,
+            "captured insertion destination should survive frontmost-app changes"
+        )
+        try expect(
+            capturedInsertionApplicationMatches(
+                capturedPID: 42,
+                capturedBundleIdentifier: "com.example.Editor",
+                runningPID: 43,
+                runningBundleIdentifier: "com.example.Editor",
+                isTerminated: false
+            ),
+            equals: false,
+            "captured insertion destination should reject a different process"
+        )
+        try expect(
+            capturedInsertionApplicationMatches(
+                capturedPID: 42,
+                capturedBundleIdentifier: "com.example.Editor",
+                runningPID: 42,
+                runningBundleIdentifier: "com.example.Replacement",
+                isTerminated: false
+            ),
+            equals: false,
+            "captured insertion destination should reject PID reuse by another application"
+        )
+        try expect(
+            capturedInsertionApplicationMatches(
+                capturedPID: 42,
+                capturedBundleIdentifier: "com.example.Editor",
+                runningPID: 42,
+                runningBundleIdentifier: "com.example.Editor",
+                isTerminated: true
+            ),
+            equals: false,
+            "captured insertion destination should reject a terminated application"
+        )
+
         func target(pid: pid_t, window: UInt, element: UInt) -> FocusedInsertionTargetFrame {
             FocusedInsertionTargetFrame(
                 frame: NSRect(x: 100, y: 100, width: 2, height: 18),
