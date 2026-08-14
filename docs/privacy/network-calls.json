@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "defaultTranscriptionIsLocal": true,
+  "calls": [
+    {
+      "purpose": "Check for application updates",
+      "destination": "https://api.github.com/repos/fazzilka/voice_to_text/releases/latest",
+      "when": "Control panel launch, manual check, or enabled periodic check",
+      "method": "GET",
+      "userContent": false
+    },
+    {
+      "purpose": "Fetch the signed update manifest",
+      "destination": "https://raw.githubusercontent.com/fazzilka/voice_to_text/main/update.json",
+      "when": "The user confirms an available update",
+      "method": "GET",
+      "userContent": false
+    },
+    {
+      "purpose": "Download a release archive",
+      "destination": "https://github.com/fazzilka/voice_to_text/releases/download/v{version}/VoiceToText.zip",
+      "when": "The user confirms an available update",
+      "method": "GET",
+      "userContent": false
+    },
+    {
+      "purpose": "Download the local speech model",
+      "destination": "https://huggingface.co",
+      "when": "First model setup or an explicit model reset",
+      "method": "GET",
+      "userContent": false
+    },
+    {
+      "purpose": "Optional transcript cleanup",
+      "destination": "User-configured HTTPS OpenAI-compatible endpoint",
+      "defaultDestination": "https://api.groq.com/openai/v1",
+      "when": "Only after the user enables AI cleanup and stores an API key",
+      "method": "POST",
+      "userContent": true,
+      "payload": "Finished transcript text; microphone audio is never included",
+      "redirects": false
+    },
+    {
+      "purpose": "Test optional AI provider and model availability",
+      "destination": "User-configured HTTPS OpenAI-compatible endpoint",
+      "when": "Only after the user clicks Test connection",
+      "method": "GET",
+      "userContent": false,
+      "redirects": false
+    }
+  ]
+}
