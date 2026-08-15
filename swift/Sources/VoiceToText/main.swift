@@ -377,6 +377,18 @@ let PASTE_SUFFIX_DISPLAY: [PasteSuffix: String] = [
     .appendNewline: "Append newline",
 ]
 
+enum PunctuationStyle: String, CaseIterable {
+    case standard
+    case continuous
+    case spokenCommands = "spoken_commands"
+}
+
+let PUNCTUATION_STYLE_DISPLAY: [PunctuationStyle: String] = [
+    .standard: "Standard",
+    .continuous: "Continuous (recommended)",
+    .spokenCommands: "Spoken commands",
+]
+
 /// User-visible language choice for the v3 decoder script filter. `.auto`
 /// passes no hint and lets the decoder pick freely — the right default for
 /// almost everyone. Selecting a specific language biases the joint head
@@ -2603,6 +2615,7 @@ final class Settings: @unchecked Sendable {
     private static let keyInterfaceLanguage = "interface_language"
     private static let keyTriggerMode = "trigger_mode"
     private static let keyPasteSuffix = "paste_suffix"
+    private static let keyPunctuationStyle = "punctuation_style_v1"
     private static let keyRecentTranscripts = "recent_transcripts"
     private static let keyRecentTranscriptHistory = "recent_transcript_history"
     private static let keyRecentTranscriptEntries = "recent_transcript_entries_v1"
@@ -2830,6 +2843,17 @@ final class Settings: @unchecked Sendable {
             return .appendSpace
         }
         set { defaults.set(newValue.rawValue, forKey: Self.keyPasteSuffix) }
+    }
+
+    var punctuationStyle: PunctuationStyle {
+        get {
+            guard let raw = defaults.string(forKey: Self.keyPunctuationStyle),
+                  let style = PunctuationStyle(rawValue: raw) else {
+                return .continuous
+            }
+            return style
+        }
+        set { defaults.set(newValue.rawValue, forKey: Self.keyPunctuationStyle) }
     }
 
     var recentTranscriptLimit: RecentTranscriptLimit {
@@ -6377,14 +6401,139 @@ private func removingFinalPeriod(from text: String) -> String {
     return String(textWithoutFinalPeriod)
 }
 
+private enum PunctuationPostprocessor {
+    private static let mergeableBoundary = try! NSRegularExpression(
+        pattern: #"(?<!\.)\.(?!\.)[ \t]+([«“\"']?)([\p{L}][\p{L}\p{M}'’\-]*)"#
+    )
+    private static let trailingWord = try! NSRegularExpression(
+        pattern: #"([\p{L}]+)$"#
+    )
+    private static let protectedAbbreviations: Set<String> = [
+        "г", "им", "коп", "п", "рис", "руб", "см", "стр", "т", "ул",
+        "dr", "etc", "mr", "mrs", "ms", "no", "prof", "st", "vs",
+    ]
+    private static let safeSentenceStartersToLowercase: Set<String> = [
+        "А", "Без", "В", "Ведь", "Вообще", "Вот", "Вы", "Где", "Да", "Для",
+        "Его", "Её", "Если", "Затем", "Значит", "И", "Или", "Их", "Как",
+        "Когда", "Короче", "Мне", "Мы", "На", "Нам", "Но", "Ну", "Однако",
+        "Он", "Она", "Они", "Оно", "От", "Потом", "Потому", "Поэтому",
+        "При", "Просто", "Получается", "С", "Так", "Тогда", "Ты", "У",
+        "Хотя", "Что", "Чтобы", "Эта", "Эти", "Это", "Этот", "Я",
+        "A", "After", "And", "As", "Because", "Before", "But", "For", "He",
+        "However", "I", "If", "In", "It", "Later", "Like", "Meanwhile", "Next",
+        "On", "Or", "She", "So", "That", "Then", "They", "This", "Those", "To",
+        "We", "When", "Where", "Which", "While", "With", "You",
+    ]
+
+    private static let spokenCommandReplacements: [(patterns: [String], marker: String)] = [
+        ([#"новый абзац"#, #"новая строка"#, #"new paragraph"#], "\u{E000}"),
+        ([#"новое предложение"#, #"new sentence"#], "\u{E001}"),
+        ([#"вопросительный знак"#, #"question mark"#], "\u{E002}"),
+        ([#"восклицательный знак"#, #"exclamation mark"#], "\u{E003}"),
+        ([#"запятая"#, #"comma"#], "\u{E004}"),
+        ([#"точка"#, #"period"#, #"full stop"#], "\u{E005}"),
+    ]
+
+    static func apply(to text: String, style: PunctuationStyle) -> String {
+        switch style {
+        case .standard:
+            return text
+        case .continuous:
+            return mergingPausePeriods(in: text)
+        case .spokenCommands:
+            return applyingSpokenCommands(to: text)
+        }
+    }
+
+    private static func mergingPausePeriods(in text: String) -> String {
+        let mutable = NSMutableString(string: text)
+        let fullRange = NSRange(location: 0, length: mutable.length)
+        let matches = mergeableBoundary.matches(in: mutable as String,
+                                                 range: fullRange)
+        for match in matches.reversed() {
+            let prefixRange = NSRange(location: 0, length: match.range.location)
+            let prefix = mutable.substring(with: prefixRange)
+            if isProtectedAbbreviation(atEndOf: prefix) {
+                continue
+            }
+            let quote = mutable.substring(with: match.range(at: 1))
+            let word = mutable.substring(with: match.range(at: 2))
+            let normalizedWord: String
+            if safeSentenceStartersToLowercase.contains(word), let first = word.first {
+                normalizedWord = first.lowercased() + word.dropFirst()
+            } else {
+                normalizedWord = word
+            }
+            mutable.replaceCharacters(in: match.range,
+                                      with: ", \(quote)\(normalizedWord)")
+        }
+        return mutable as String
+    }
+
+    private static func isProtectedAbbreviation(atEndOf prefix: String) -> Bool {
+        let nsPrefix = prefix as NSString
+        let range = NSRange(location: 0, length: nsPrefix.length)
+        guard let match = trailingWord.firstMatch(in: prefix, range: range) else {
+            return false
+        }
+        let word = nsPrefix.substring(with: match.range(at: 1)).lowercased()
+        return word.count == 1 || protectedAbbreviations.contains(word)
+    }
+
+    private static func applyingSpokenCommands(to text: String) -> String {
+        var output = text
+        for replacement in spokenCommandReplacements {
+            for phrase in replacement.patterns {
+                let pattern = #"(?iu)\b"# + phrase + #"\b[,.]?"#
+                guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+                let range = NSRange(location: 0, length: (output as NSString).length)
+                output = regex.stringByReplacingMatches(in: output,
+                                                         range: range,
+                                                         withTemplate: replacement.marker)
+            }
+        }
+
+        output = mergingPausePeriods(in: output)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        output = removingFinalPeriod(from: output)
+        output = replacingMarker("\u{E000}", in: output, with: "\n\n")
+        output = replacingMarker("\u{E001}", in: output, with: ". ")
+        output = replacingMarker("\u{E002}", in: output, with: "? ")
+        output = replacingMarker("\u{E003}", in: output, with: "! ")
+        output = replacingMarker("\u{E004}", in: output, with: ", ")
+        output = replacingMarker("\u{E005}", in: output, with: ". ")
+        output = output
+            .replacingOccurrences(of: ".,", with: ".")
+            .replacingOccurrences(of: "?,", with: "?")
+            .replacingOccurrences(of: "!,", with: "!")
+        return output.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func replacingMarker(_ marker: String,
+                                        in text: String,
+                                        with replacement: String) -> String {
+        let escaped = NSRegularExpression.escapedPattern(for: marker)
+        guard let regex = try? NSRegularExpression(pattern: #"[ \t]*"# + escaped + #"[ \t]*"#) else {
+            return text
+        }
+        let range = NSRange(location: 0, length: (text as NSString).length)
+        return regex.stringByReplacingMatches(in: text,
+                                              range: range,
+                                              withTemplate: replacement)
+    }
+}
+
 private func finalizedDictationText(_ text: String,
+                                    punctuationStyle: PunctuationStyle = .standard,
                                     removeFinalPeriod: Bool) -> String {
-    removeFinalPeriod ? removingFinalPeriod(from: text) : text
+    let punctuated = PunctuationPostprocessor.apply(to: text, style: punctuationStyle)
+    return removeFinalPeriod ? removingFinalPeriod(from: punctuated) : punctuated
 }
 
 private func processedDictationText(rawTranscript: String,
                                     corrections: [TranscriptCorrection],
                                     removeFillerWords: Bool,
+                                    punctuationStyle: PunctuationStyle = .standard,
                                     removeFinalPeriod: Bool = false,
                                     language: DictationLanguage = .auto) -> DictationTextProcessingResult {
     let trimmed = rawTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -6403,6 +6552,7 @@ private func processedDictationText(rawTranscript: String,
     }
 
     let finalText = finalizedDictationText(textAfterFillers,
+                                           punctuationStyle: punctuationStyle,
                                            removeFinalPeriod: removeFinalPeriod)
     return DictationTextProcessingResult(text: finalText,
                                          appliedCorrectionCount: corrected.appliedCount,
@@ -11282,6 +11432,7 @@ final class VoiceToTextApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 let processed = processedDictationText(rawTranscript: transcription.text,
                                                        corrections: settings.transcriptCorrections,
                                                        removeFillerWords: settings.removeFillerWords,
+                                                       punctuationStyle: settings.punctuationStyle,
                                                        removeFinalPeriod: settings.removeFinalPeriod,
                                                        language: settings.dictationLanguage)
                 if !processed.text.isEmpty {
@@ -12715,6 +12866,7 @@ final class VoiceToTextApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     let processed = processedDictationText(rawTranscript: transcription.text,
                                                            corrections: settings.transcriptCorrections,
                                                            removeFillerWords: settings.removeFillerWords,
+                                                           punctuationStyle: settings.punctuationStyle,
                                                            removeFinalPeriod: settings.removeFinalPeriod,
                                                            language: settings.dictationLanguage)
                     let postprocessingCompletedAt = ProcessInfo.processInfo.systemUptime
@@ -12746,6 +12898,7 @@ final class VoiceToTextApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     }
                     finalText = finalizedDictationText(
                         finalText,
+                        punctuationStyle: settings.punctuationStyle,
                         removeFinalPeriod: settings.removeFinalPeriod
                     )
 
@@ -12923,6 +13076,7 @@ final class VoiceToTextApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     let processed = processedDictationText(rawTranscript: transcription.text,
                                                            corrections: settings.transcriptCorrections,
                                                            removeFillerWords: settings.removeFillerWords,
+                                                           punctuationStyle: settings.punctuationStyle,
                                                            removeFinalPeriod: settings.removeFinalPeriod,
                                                            language: settings.dictationLanguage)
                     if !processed.text.isEmpty {
@@ -14394,6 +14548,7 @@ final class VoiceToTextApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 "Trigger mode: \(TRIGGER_DISPLAY[settings.triggerMode] ?? settings.triggerMode.rawValue)",
                 "Speech model: \(speechModelProfile.displayName)",
                 "Language: \(languageSettingText)",
+                "Punctuation style: \(PUNCTUATION_STYLE_DISPLAY[settings.punctuationStyle] ?? settings.punctuationStyle.rawValue)",
                 "Paste behavior: \(PASTE_SUFFIX_DISPLAY[settings.pasteSuffix] ?? settings.pasteSuffix.rawValue)",
                 "Remove filler words: \(settings.removeFillerWords)",
                 "Remove final period: \(settings.removeFinalPeriod)",
@@ -14828,6 +14983,7 @@ final class VoiceToTextApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         sub.autoenablesItems = false
 
         sub.addItem(buildPasteSuffixSettingsItem())
+        sub.addItem(buildPunctuationStyleSettingsItem())
         sub.addItem(buildRecentTranscriptLimitSettingsItem())
         sub.addItem(buildCorrectionsItem())
 
@@ -15007,6 +15163,25 @@ final class VoiceToTextApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         pasteParent.submenu = pasteSub
         return pasteParent
+    }
+
+    private func buildPunctuationStyleSettingsItem() -> NSMenuItem {
+        let parent = NSMenuItem(title: "Punctuation Style", action: nil, keyEquivalent: "")
+        let submenu = NSMenu()
+        submenu.autoenablesItems = false
+        for style in PunctuationStyle.allCases {
+            let item = NSMenuItem(
+                title: PUNCTUATION_STYLE_DISPLAY[style] ?? style.rawValue,
+                action: #selector(selectPunctuationStyle(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.state = style == settings.punctuationStyle ? .on : .off
+            item.representedObject = style.rawValue
+            submenu.addItem(item)
+        }
+        parent.submenu = submenu
+        return parent
     }
 
     private func buildRecentTranscriptLimitSettingsItem() -> NSMenuItem {
@@ -16268,6 +16443,13 @@ final class VoiceToTextApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard let raw = sender.representedObject as? String,
               let suffix = PasteSuffix(rawValue: raw) else { return }
         settings.pasteSuffix = suffix
+        rebuildMenu()
+    }
+
+    @objc private func selectPunctuationStyle(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let style = PunctuationStyle(rawValue: raw) else { return }
+        settings.punctuationStyle = style
         rebuildMenu()
     }
 
@@ -18269,6 +18451,47 @@ private enum VoiceToTextSelfTest {
             "disabled final period postprocessing should preserve existing behavior"
         )
 
+        try expect(
+            PunctuationPostprocessor.apply(
+                to: "Короче, я говорю, ну, в принципе, ковёр хороший. Но как-то слишком много узоров. Я хотел бы какой-нибудь монотонный. Это было бы лучше.",
+                style: .continuous
+            ),
+            equals: "Короче, я говорю, ну, в принципе, ковёр хороший, но как-то слишком много узоров, я хотел бы какой-нибудь монотонный, это было бы лучше.",
+            "continuous punctuation should merge pause-created sentences into one thought"
+        )
+        try expect(
+            PunctuationPostprocessor.apply(
+                to: "Это вопрос? Да! Потом версия 1.2 готова... Отлично.",
+                style: .continuous
+            ),
+            equals: "Это вопрос? Да! Потом версия 1.2 готова... Отлично.",
+            "continuous punctuation should preserve questions, exclamations, decimals, and ellipses"
+        )
+        try expect(
+            PunctuationPostprocessor.apply(
+                to: "См. приложение. Потом продолжим.",
+                style: .continuous
+            ),
+            equals: "См. приложение, потом продолжим.",
+            "continuous punctuation should preserve common abbreviations"
+        )
+        try expect(
+            PunctuationPostprocessor.apply(
+                to: "Ковёр хороший. Но узоров много. Новый абзац Я хочу однотонный точка",
+                style: .spokenCommands
+            ),
+            equals: "Ковёр хороший, но узоров много.\n\nЯ хочу однотонный.",
+            "spoken-command punctuation should merge automatic periods and honor explicit paragraphs and periods"
+        )
+        try expect(
+            PunctuationPostprocessor.apply(
+                to: "Is this ready question mark yes comma it is period",
+                style: .spokenCommands
+            ),
+            equals: "Is this ready? yes, it is.",
+            "spoken-command punctuation should support English commands"
+        )
+
         let settingsSuiteName = "com.fazzilka.voicetotext.self-test.postprocessing.\(UUID().uuidString)"
         guard let settingsDefaults = UserDefaults(suiteName: settingsSuiteName) else {
             throw SelfTestFailure.failed("could not create isolated postprocessing defaults")
@@ -18277,17 +18500,28 @@ private enum VoiceToTextSelfTest {
         defer { settingsDefaults.removePersistentDomain(forName: settingsSuiteName) }
         let initialSettings = Settings(defaults: settingsDefaults)
         try expect(
+            initialSettings.punctuationStyle,
+            equals: .continuous,
+            "continuous punctuation should be the beta default"
+        )
+        try expect(
             initialSettings.removeFinalPeriod,
             equals: false,
             "final period removal should default to disabled"
         )
         initialSettings.removeFinalPeriod = true
+        initialSettings.punctuationStyle = .spokenCommands
         settingsDefaults.synchronize()
         let reloadedSettings = Settings(defaults: settingsDefaults)
         try expect(
             reloadedSettings.removeFinalPeriod,
             equals: true,
             "final period removal should persist across settings instances"
+        )
+        try expect(
+            reloadedSettings.punctuationStyle,
+            equals: .spokenCommands,
+            "punctuation style should persist across settings instances"
         )
 
         try expect(
@@ -22105,6 +22339,7 @@ private struct ControlPanelSettingsDraft: Equatable {
     var aiCleanupBaseURL: String
     var aiCleanupModel: String
     var inputDevicePreference: String
+    var punctuationStyle: PunctuationStyle
     var removeFinalPeriod: Bool
     var recordingColor: RecordingHUDAccentColor
     var transcribingColor: RecordingHUDAccentColor
@@ -22123,6 +22358,7 @@ private struct ControlPanelSettingsDraft: Equatable {
         aiCleanupModel = settings.aiCleanupModel
         let savedInput = settings.inputDevice
         inputDevicePreference = audioInputDevice(matching: savedInput)?.uid ?? savedInput
+        punctuationStyle = settings.punctuationStyle
         removeFinalPeriod = settings.removeFinalPeriod
         recordingColor = settings.recordingHUDRecordingColor
         transcribingColor = settings.recordingHUDTranscribingColor
@@ -22364,6 +22600,7 @@ private final class VoiceToTextControlPanelApp: NSObject, NSApplicationDelegate,
                 inputDevices,
                 settings.primaryCompletionBehavior.rawValue,
                 settings.alternateCompletionEnabled ? "alternate-on" : "alternate-off",
+                settings.punctuationStyle.rawValue,
                 settings.removeFinalPeriod ? "remove-period-on" : "remove-period-off",
                 settings.triggerMode.rawValue,
                 settings.recordingHUDRecordingColor.rawValue,
@@ -22461,6 +22698,16 @@ private final class VoiceToTextControlPanelApp: NSObject, NSApplicationDelegate,
                                            size: 12,
                                            weight: .semibold,
                                            color: .secondaryLabelColor))
+        root.addArrangedSubview(popupRow(
+            title: t("Стиль пунктуации", "Punctuation style"),
+            detail: t("Непрерывный режим объединяет фразы через запятые; режим команд ставит знаки по произнесённым словам.",
+                      "Continuous mode joins paused phrases with commas; command mode follows spoken punctuation commands."),
+            selectedValue: draft.punctuationStyle.rawValue,
+            options: PunctuationStyle.allCases.map { (localizedPunctuationStyleName($0), $0.rawValue) },
+            action: #selector(selectPunctuationStyleDraft(_:)),
+            toolTip: t("Выберите стандартную, непрерывную или управляемую голосовыми командами пунктуацию.",
+                       "Choose standard, continuous, or spoken-command punctuation.")
+        ))
         root.addArrangedSubview(removeFinalPeriodRow(draft))
         root.addArrangedSubview(separator())
         root.addArrangedSubview(popupRow(
@@ -24107,6 +24354,17 @@ private final class VoiceToTextControlPanelApp: NSObject, NSApplicationDelegate,
         }
     }
 
+    private func localizedPunctuationStyleName(_ style: PunctuationStyle) -> String {
+        guard language == .russian else {
+            return PUNCTUATION_STYLE_DISPLAY[style] ?? style.rawValue
+        }
+        switch style {
+        case .standard: return "Стандартный"
+        case .continuous: return "Непрерывный (рекомендуется)"
+        case .spokenCommands: return "По голосовым командам"
+        }
+    }
+
     private func beginServiceOperation(_ operation: ControlPanelServiceOperation) {
         guard serviceOperation == nil else { return }
         serviceOperation = operation
@@ -24350,6 +24608,15 @@ private final class VoiceToTextControlPanelApp: NSObject, NSApplicationDelegate,
         refreshSettingsWindow()
     }
 
+    @objc private func selectPunctuationStyleDraft(_ sender: NSPopUpButton) {
+        guard let raw = sender.selectedItem?.representedObject as? String,
+              let style = PunctuationStyle(rawValue: raw) else { return }
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.punctuationStyle = style
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
     @objc private func selectRecordingHUDRecordingColor(_ sender: NSPopUpButton) {
         guard let raw = sender.selectedItem?.representedObject as? String,
               let color = RecordingHUDAccentColor(rawValue: raw) else { return }
@@ -24561,6 +24828,7 @@ private final class VoiceToTextControlPanelApp: NSObject, NSApplicationDelegate,
         settings.aiCleanupBaseURL = draft.aiCleanupBaseURL
         settings.aiCleanupModel = draft.aiCleanupModel
         settings.inputDevice = draft.inputDevicePreference
+        settings.punctuationStyle = draft.punctuationStyle
         settings.removeFinalPeriod = draft.removeFinalPeriod
         settings.recordingHUDRecordingColor = draft.recordingColor
         settings.recordingHUDTranscribingColor = draft.transcribingColor
