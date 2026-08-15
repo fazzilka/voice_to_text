@@ -14,15 +14,15 @@ jobs:
     steps:
       - name: Install from the public command
         run: |
-          curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/main/install.sh | \
-            SUPERDICTATE_NO_OPEN=1 bash
+          curl -fsSL https://raw.githubusercontent.com/fazzilka/voice_to_text/main/install.sh | \
+            VOICE_TO_TEXT_NO_OPEN=1 bash
       - name: Verify installed release
         run: |
-          test -x /Applications/SuperDictate.app/Contents/MacOS/SuperDictate
-          test "$(plutil -extract CFBundleIdentifier raw -o - /Applications/SuperDictate.app/Contents/Info.plist)" = "com.local.superdictate"
-          test "$(plutil -extract CFBundleShortVersionString raw -o - /Applications/SuperDictate.app/Contents/Info.plist)" = "0.2.40"
-          file /Applications/SuperDictate.app/Contents/MacOS/SuperDictate | grep -q arm64
-          codesign --verify --deep --strict /Applications/SuperDictate.app
-          codesign -d --entitlements :- /Applications/SuperDictate.app > "$RUNNER_TEMP/entitlements.plist" 2>/dev/null
+          test -x /Applications/VoiceToText.app/Contents/MacOS/VoiceToText
+          test "$(plutil -extract CFBundleIdentifier raw -o - /Applications/VoiceToText.app/Contents/Info.plist)" = "com.fazzilka.voicetotext"
+          test "$(plutil -extract CFBundleShortVersionString raw -o - /Applications/VoiceToText.app/Contents/Info.plist)" = "0.1.0"
+          file /Applications/VoiceToText.app/Contents/MacOS/VoiceToText | grep -q arm64
+          codesign --verify --deep --strict /Applications/VoiceToText.app
+          codesign -d --entitlements :- /Applications/VoiceToText.app > "$RUNNER_TEMP/entitlements.plist" 2>/dev/null
           test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.device.audio-input' "$RUNNER_TEMP/entitlements.plist")" = "true"
           test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.device.microphone' "$RUNNER_TEMP/entitlements.plist")" = "true"

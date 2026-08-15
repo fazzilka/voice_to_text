@@ -2,25 +2,26 @@
 
 set -euo pipefail
 
-REPOSITORY="${SUPERDICTATE_REPOSITORY:-shlgd/SuperDictate}"
-RELEASE_VERSION="0.2.40"
-RELEASE_SHA256="5fb207f162f677f1b89d7bfda6df4f421ac2886f795a2d9c421c3434105a5731"
-SOURCE_COMMIT="a0c8114c343d9635b2135e295db1a7e73ccfd943"
-RELEASE_URL="${SUPERDICTATE_RELEASE_URL:-https://github.com/$REPOSITORY/releases/download/v$RELEASE_VERSION/SuperDictate.zip}"
-EXPECTED_SHA256="${SUPERDICTATE_RELEASE_SHA256:-$RELEASE_SHA256}"
-REF="${SUPERDICTATE_REF:-$SOURCE_COMMIT}"
-EXPECTED_SOURCE_COMMIT="${SUPERDICTATE_SOURCE_COMMIT:-$SOURCE_COMMIT}"
-APP_PATH="${SUPERDICTATE_APP_PATH:-/Applications/SuperDictate.app}"
-BUILD_FROM_SOURCE="${SUPERDICTATE_BUILD_FROM_SOURCE:-0}"
-NO_OPEN="${SUPERDICTATE_NO_OPEN:-0}"
-AGENT_LABEL="com.local.superdictate.agent"
+REPOSITORY="${VOICE_TO_TEXT_REPOSITORY:-fazzilka/voice_to_text}"
+RELEASE_VERSION="0.1.0"
+# Updated with the immutable archive checksum when v0.1.0 is published.
+RELEASE_SHA256="0000000000000000000000000000000000000000000000000000000000000000"
+SOURCE_REF="main"
+RELEASE_URL="${VOICE_TO_TEXT_RELEASE_URL:-https://github.com/$REPOSITORY/releases/download/v$RELEASE_VERSION/VoiceToText.zip}"
+EXPECTED_SHA256="${VOICE_TO_TEXT_RELEASE_SHA256:-$RELEASE_SHA256}"
+REF="${VOICE_TO_TEXT_REF:-$SOURCE_REF}"
+EXPECTED_SOURCE_COMMIT="${VOICE_TO_TEXT_SOURCE_COMMIT:-}"
+APP_PATH="${VOICE_TO_TEXT_APP_PATH:-/Applications/VoiceToText.app}"
+BUILD_FROM_SOURCE="${VOICE_TO_TEXT_BUILD_FROM_SOURCE:-0}"
+NO_OPEN="${VOICE_TO_TEXT_NO_OPEN:-0}"
+AGENT_LABEL="com.fazzilka.voicetotext.agent"
 
 say() {
-    printf '\033[1;36mSuperDictate:\033[0m %s\n' "$*"
+    printf '\033[1;36mVoiceToText:\033[0m %s\n' "$*"
 }
 
 fail() {
-    printf '\033[1;31mSuperDictate:\033[0m %s\n' "$*" >&2
+    printf '\033[1;31mVoiceToText:\033[0m %s\n' "$*" >&2
     exit 1
 }
 
@@ -52,12 +53,12 @@ run_as_admin() {
 
 verify_app() {
     local app="$1"
-    local executable="$app/Contents/MacOS/SuperDictate"
+    local executable="$app/Contents/MacOS/VoiceToText"
     local bundle_id version minimum_system entitlements_file audio_input microphone
 
-    [[ -x "$executable" ]] || fail "В архиве нет исполняемого файла SuperDictate."
+    [[ -x "$executable" ]] || fail "В архиве нет исполняемого файла VoiceToText."
     bundle_id="$(plutil -extract CFBundleIdentifier raw -o - "$app/Contents/Info.plist")"
-    [[ "$bundle_id" == "com.local.superdictate" ]] || fail "Неверный идентификатор приложения: $bundle_id"
+    [[ "$bundle_id" == "com.fazzilka.voicetotext" ]] || fail "Неверный идентификатор приложения: $bundle_id"
     version="$(plutil -extract CFBundleShortVersionString raw -o - "$app/Contents/Info.plist")"
     [[ "$version" == "$RELEASE_VERSION" ]] || fail "Ожидалась версия $RELEASE_VERSION, получена $version."
     minimum_system="$(plutil -extract LSMinimumSystemVersion raw -o - "$app/Contents/Info.plist")"
@@ -73,7 +74,7 @@ verify_app() {
 
 download_release() {
     local work_dir="$1"
-    local archive="$work_dir/SuperDictate.zip"
+    local archive="$work_dir/VoiceToText.zip"
     local actual
 
     say "Скачиваю готовую сборку $RELEASE_VERSION..."
@@ -85,14 +86,16 @@ download_release() {
     [[ "$actual" == "$EXPECTED_SHA256" ]] || fail "Контрольная сумма загрузки не совпала."
 
     ditto -x -k "$archive" "$work_dir/release"
-    [[ -d "$work_dir/release/SuperDictate.app" ]] || fail "В релизе нет SuperDictate.app."
-    ditto "$work_dir/release/SuperDictate.app" "$work_dir/SuperDictate.app"
+    [[ -d "$work_dir/release/VoiceToText.app" ]] || fail "В релизе нет VoiceToText.app."
+    ditto "$work_dir/release/VoiceToText.app" "$work_dir/VoiceToText.app"
 }
 
 verify_source_ref() {
     local actual
 
-    [[ "$EXPECTED_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || fail "Ожидался полный 40-символьный SHA исходников."
+    if [[ -n "$EXPECTED_SOURCE_COMMIT" ]]; then
+        [[ "$EXPECTED_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || fail "Ожидался полный 40-символьный SHA исходников."
+    fi
 
     actual="$(curl --fail --location --silent --show-error --retry 3 --retry-delay 1 --retry-all-errors \
         "https://api.github.com/repos/$REPOSITORY/commits/$REF" \
@@ -100,7 +103,9 @@ verify_source_ref() {
         | head -n 1)"
 
     [[ -n "$actual" ]] || fail "Не удалось проверить коммит исходников $REF."
-    [[ "$actual" == "$EXPECTED_SOURCE_COMMIT" ]] || fail "Коммит исходников не совпал: ожидался $EXPECTED_SOURCE_COMMIT, получен $actual."
+    if [[ -n "$EXPECTED_SOURCE_COMMIT" ]]; then
+        [[ "$actual" == "$EXPECTED_SOURCE_COMMIT" ]] || fail "Коммит исходников не совпал: ожидался $EXPECTED_SOURCE_COMMIT, получен $actual."
+    fi
 }
 
 build_from_source() {
@@ -124,7 +129,7 @@ build_from_source() {
     ditto -x -k "$work_dir/source.zip" "$work_dir/source"
     source_dir="$(find "$work_dir/source" -mindepth 1 -maxdepth 1 -type d -print -quit)"
     [[ -n "$source_dir" ]] || fail "Не удалось распаковать исходный код."
-    "$source_dir/scripts/build-app.sh" "$work_dir/SuperDictate.app"
+    "$source_dir/scripts/build-app.sh" "$work_dir/VoiceToText.app"
 }
 
 [[ "$(/usr/bin/uname -s)" == "Darwin" ]] || fail "Работает только на macOS."
@@ -135,7 +140,7 @@ for command_name in curl ditto shasum plutil file codesign sed head; do
     command -v "$command_name" >/dev/null 2>&1 || fail "Не найдена системная команда: $command_name"
 done
 
-WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/superdictate-install.XXXXXX")"
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/voice-to-text-install.XXXXXX")"
 trap 'rm -rf "$WORK_DIR"' EXIT
 
 if [[ "$BUILD_FROM_SOURCE" == "1" ]]; then
@@ -144,19 +149,19 @@ else
     download_release "$WORK_DIR"
 fi
 
-verify_app "$WORK_DIR/SuperDictate.app"
+verify_app "$WORK_DIR/VoiceToText.app"
 say "Устанавливаю приложение в $APP_PATH..."
 
-if [[ "$APP_PATH" == "/Applications/SuperDictate.app" ]]; then
+if [[ "$APP_PATH" == "/Applications/VoiceToText.app" ]]; then
     /bin/launchctl bootout "gui/$UID/$AGENT_LABEL" >/dev/null 2>&1 || true
-    /usr/bin/pkill -x SuperDictate >/dev/null 2>&1 || true
+    /usr/bin/pkill -x VoiceToText >/dev/null 2>&1 || true
 fi
 
-INCOMING="$(dirname "$APP_PATH")/.SuperDictate.install.$$"
-BACKUP="$(dirname "$APP_PATH")/.SuperDictate.previous.$$"
+INCOMING="$(dirname "$APP_PATH")/.VoiceToText.install.$$"
+BACKUP="$(dirname "$APP_PATH")/.VoiceToText.previous.$$"
 run_as_admin rm -rf "$INCOMING"
 run_as_admin rm -rf "$BACKUP"
-run_as_admin ditto "$WORK_DIR/SuperDictate.app" "$INCOMING"
+run_as_admin ditto "$WORK_DIR/VoiceToText.app" "$INCOMING"
 verify_app "$INCOMING"
 
 if [[ -e "$APP_PATH" ]]; then
@@ -175,7 +180,7 @@ run_as_admin rm -rf "$BACKUP"
 if [[ "$NO_OPEN" == "1" ]]; then
     say "Готово. Проверенная сборка установлена."
 else
-    say "Готово. Открываю SuperDictate..."
+    say "Готово. Открываю VoiceToText..."
     open "$APP_PATH"
     printf '\n1. Нажмите «Разрешить» для микрофона, универсального доступа и мониторинга ввода.\n'
     printf '2. Дождитесь загрузки локальной модели и статуса «Работает».\n'

@@ -1,6 +1,6 @@
 // swift-tools-version: 6.0
 //
-// SuperDictate — a Swift push-to-talk dictation app
+// VoiceToText — a Swift push-to-talk dictation app
 // for macOS Apple Silicon. Native AppKit / AVFoundation, FluidAudio
 // driving Parakeet TDT v3 on the Apple Neural Engine. macOS 14
 // (Sonoma) minimum. The Hardened Runtime microphone entitlement
@@ -13,21 +13,23 @@
 import PackageDescription
 
 let package = Package(
-    name: "Parakey",
+    name: "VoiceToText",
     platforms: [
         .macOS("14.0"),
     ],
     products: [
-        .executable(name: "Parakey", targets: ["Parakey"]),
+        .executable(name: "VoiceToText", targets: ["VoiceToText"]),
     ],
     dependencies: [
+        .package(path: "../core"),
         .package(url: "https://github.com/FluidInference/FluidAudio.git",
                  revision: "313feb4bd692780a9a5b5fa9048fdb119486dde8"),
     ],
     targets: [
         .executableTarget(
-            name: "Parakey",
+            name: "VoiceToText",
             dependencies: [
+                .product(name: "VoiceToTextCore", package: "core"),
                 .product(name: "FluidAudio", package: "FluidAudio"),
             ]
             // No `resources:` here on purpose. SwiftPM bundles them as

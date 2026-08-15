@@ -5,8 +5,9 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-bash -n install.sh uninstall.sh scripts/build-app.sh scripts/check.sh
+bash -n install.sh uninstall.sh scripts/build-app.sh scripts/check.sh scripts/security-audit.sh
 plutil -lint swift/Info.plist entitlements.plist
+plutil -convert xml1 -o /dev/null docs/privacy/network-calls.json
 
 app_version="$(plutil -extract CFBundleShortVersionString raw -o - swift/Info.plist)"
 installer_version="$(sed -n 's/^RELEASE_VERSION="\([^"]*\)"$/\1/p' install.sh)"
@@ -29,15 +30,17 @@ manifest_sha256="$(plutil -extract sha256 raw -o - update.json)"
 grep -q 'com.apple.security.device.audio-input' entitlements.plist
 grep -q 'com.apple.security.device.microphone' entitlements.plist
 
-! grep -q 'raw.githubusercontent.com/shlgd/SuperDictate/main/' README.md
-grep -q 'raw.githubusercontent.com/shlgd/SuperDictate/v'"$app_version"'/' README.md
-grep -q '^REF="${SUPERDICTATE_REF:-\$SOURCE_COMMIT}"$' install.sh
-grep -q '^EXPECTED_SOURCE_COMMIT="${SUPERDICTATE_SOURCE_COMMIT:-\$SOURCE_COMMIT}"$' install.sh
+grep -q 'fazzilka/voice_to_text' install.sh
+grep -q '^REF="${VOICE_TO_TEXT_REF:-\$SOURCE_REF}"$' install.sh
+grep -q '^EXPECTED_SOURCE_COMMIT="${VOICE_TO_TEXT_SOURCE_COMMIT:-}"$' install.sh
 grep -q 'verify_source_ref' install.sh
 grep -q 'sysctl.proc_translated' install.sh
 grep -q 'is_apple_silicon' install.sh
 grep -q 'Restarting the build natively for Apple Silicon' scripts/build-app.sh
 grep -q 'validate_output_app_path "$OUTPUT_APP"' scripts/build-app.sh
+grep -q 'maximumRecordingSeconds: TimeInterval = 40 \* 60' core/Sources/VoiceToTextCore/RecordingPolicy.swift
+grep -q 'VoiceToTextCore' swift/Package.swift
 
+./scripts/security-audit.sh
 git diff --check
-printf 'SuperDictate checks passed (v%s).\n' "$app_version"
+printf 'VoiceToText checks passed (v%s).\n' "$app_version"
